@@ -94,6 +94,14 @@ impl Runner {
         self.sanity_check()?; // catch unsupported flags now, not mid-fuzz
         Ok(self)
     }
+    
+    pub fn with_o0(self) -> Result<Self> {
+        Ok(self.with_flags(["-O0"])?)
+    }
+
+    pub fn with_o2(self) -> Result<Self> {
+        Ok(self.with_flags(["-O2"])?)
+    }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
