@@ -55,9 +55,13 @@ impl Report {
             code
         )
     }
-    pub fn report(code: &str, a: &RunOutput, b: &RunOutput, diffs: Vec<DiffType>) -> Result<()> {
-        let id = Uuid::new_v4();
+    pub fn report(code: &str, a: &RunOutput, b: &RunOutput, diffs: Vec<DiffType>) -> Result<Uuid> {
+        let id = Self::gen_id();
         fs::write(format!("../diffs/{}.md", id), Self::construct(code, a, b, diffs, &id))?;
-        Ok(())
+        Ok(id)
+    }
+
+    fn gen_id() -> Uuid {
+        Uuid::new_v4()
     }
 }
