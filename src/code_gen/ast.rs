@@ -157,6 +157,17 @@ pub enum Expr {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExprKind {
+    Literal,
+    Unary,
+    Binary,
+    Paren,
+    Function,
+    Table,
+    IfElse
+}
+
 // ---------------------------------------------------------------------------
 // Statements
 // ---------------------------------------------------------------------------

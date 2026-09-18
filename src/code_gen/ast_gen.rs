@@ -1,4 +1,8 @@
+//! Engine for generating random Luau ASTs, with a goal
+//! of disgustingness.
+
 use crate::code_gen::ast::*;
+use crate::code_gen::env::*;
 use crate::code_gen::costs::DEFAULT_COSTS;
 use crate::code_gen::ident_gen::IdentGen;
 use rand;
@@ -10,12 +14,19 @@ pub struct AstGenerator {
     fuel: i32,
     expr_depth: i32,
     function_depth: i32,
-    ident_gen: IdentGen
+    ident_gen: IdentGen,
+    env: Env,
 }
 
 impl AstGenerator {
     pub fn new(fuel: u32) -> Self {
-        Self { fuel: fuel as i32, expr_depth: 0, function_depth: 0, ident_gen: IdentGen::new() }
+        Self {
+            fuel: fuel as i32,
+            expr_depth: 0,
+            function_depth: 0,
+            ident_gen: IdentGen::new(),
+            env: Env::default()
+        }
     }
 
     fn use_fuel(&mut self, amount: i32) -> Result<(), ()> {
@@ -42,7 +53,7 @@ impl AstGenerator {
     fn gen_rand_string(len: u8) -> String {
         let mut str: Vec<u8> = vec![];
         for _ in 0..len {
-            str.push(rand::random_range(32..=126));
+            str.push('a' as u8);
         }
         String::from_utf8(str).unwrap()
     }
@@ -56,7 +67,7 @@ impl AstGenerator {
             2 => Literal::String(String::from("")),
             3 => Literal::String(
                 Self::gen_rand_string(
-                    rand::random_range(1..=u8::MAX)
+                    rand::random_range(1..=10)
                 )
             ),
             _ => Literal::Nil
@@ -71,91 +82,167 @@ impl AstGenerator {
         }
     }
 
-    fn gen_annotation(honest: Literal) -> TypeAnnot {
+    fn gen_annotation(honest: &Ty) -> TypeAnnot {
         TypeAnnot::Any // TODO: implement TypeAnnot gen
     }
 
-    fn gen_local_name(&mut self, kind: Literal) -> LocalName {
+    fn gen_local_name(&mut self, honest: &Ty) -> LocalName {
         LocalName {
             name: self.ident_gen.gen_ident(),
-            annotation: Some(Self::gen_annotation(kind))
+            annotation: Some(Self::gen_annotation(honest))
         }
     }
 
-    fn gen_random_literal() -> Literal {
+    fn gen_random_literal(want: &Ty) -> Literal {
+        match want {
+            Ty::Nil => Literal::Nil,
+            Ty::Number => Self::gen_number(),
+            Ty::Boolean => Self::gen_boolean(),
+            Ty::String => Self::gen_string(),
+            // `Any`: the literal decides its own type
+            _ => match rand::random_range(1..=4) {
+                1 => Literal::Nil,
+                2 => Self::gen_number(),
+                3 => Self::gen_boolean(),
+                _ => Self::gen_string()
+            }
+        }
+    }
+
+    /// A type for a position that does not care which one it gets.
+    fn gen_ty() -> Ty {
+        match rand::random_range(1..=6) {
+            1 => Ty::Number,
+            2 => Ty::String,
+            3 => Ty::Boolean,
+            4 => Ty::Nil,
+            5 => Ty::Array(Box::from(Self::gen_element_ty())),
+            _ => Ty::Any
+        }
+        // TODO: Ty::Function, once a body can be generated to match a signature
+    }
+
+    /// Element types stay scalar, so a type cannot nest without bound.
+    fn gen_element_ty() -> Ty {
         match rand::random_range(1..=4) {
-            1 => Literal::Nil,
-            2 => Self::gen_number(),
-            3 => Self::gen_boolean(),
-            4 => Self::gen_string(),
-            _ => Literal::Nil
+            1 => Ty::Number,
+            2 => Ty::String,
+            3 => Ty::Boolean,
+            _ => Ty::Any
         }
     }
 
-    fn get_avail(&self) -> Vec<u8> {
+    /// Get the expression forms that can produce a `want` in the current state
+    fn get_avail(&self, want: &Ty) -> Vec<ExprKind> {
+        // at the depth cap, only the form that needs nothing below it
         if self.expr_depth >= DEFAULT_COSTS.max_expr_depth {
-            return vec![0];
+            return vec![Self::leaf_kind(want)];
         }
 
-        let mut avail: Vec<u8> = vec![0, 3, 4, 5, 10, 11];
-        if self.function_depth < DEFAULT_COSTS.max_function_depth {
-            avail.push(9);
+        // these two pass the demand straight through, so they fit any `want`
+        let mut avail: Vec<ExprKind> = vec![ExprKind::Paren, ExprKind::IfElse];
+        match want {
+            Ty::Number => avail.extend([ExprKind::Literal, ExprKind::Unary, ExprKind::Binary]),
+            Ty::String => avail.extend([ExprKind::Literal, ExprKind::Binary]),
+            Ty::Boolean => avail.extend([ExprKind::Literal, ExprKind::Unary, ExprKind::Binary]),
+            Ty::Nil => avail.push(ExprKind::Literal),
+            Ty::Array(_) => avail.push(ExprKind::Table),
+            Ty::Function(_) => avail.push(ExprKind::Function),
+            Ty::Any => {
+                avail.extend([ExprKind::Literal, ExprKind::Unary, ExprKind::Binary, ExprKind::Table]);
+                if self.function_depth < DEFAULT_COSTS.max_function_depth {
+                    avail.push(ExprKind::Function);
+                }
+            }
         }
 
-        avail // TODO: implement availability
+        avail // TODO: Var, Call, Index and Field, once the env is filled in
     }
 
-    fn gen_un_op() -> UnOp {
-        match rand::random_range(1..=3) {
-            1 => UnOp::Neg,
-            2 => UnOp::Not,
-            3 => UnOp::Len,
-            _=>{ UnOp::Neg }
+    /// The only form that can produce a `want` with no expression under it,
+    /// for when the depth cap is reached.
+    fn leaf_kind(want: &Ty) -> ExprKind {
+        match want {
+            Ty::Array(_) => ExprKind::Table,
+            Ty::Function(_) => ExprKind::Function,
+            _ => ExprKind::Literal
         }
     }
 
-    fn gen_unary_expr(&mut self) -> Result<Expr, ()> {
+    /// `-` and `#` produce a number, `not` produces a boolean.
+    fn un_ops_for(want: &Ty) -> Vec<UnOp> {
+        match want {
+            Ty::Number => vec![UnOp::Neg, UnOp::Len],
+            Ty::Boolean => vec![UnOp::Not],
+            _ => vec![UnOp::Neg, UnOp::Not, UnOp::Len]
+        }
+    }
+
+    fn gen_unary_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
         self.use_fuel(DEFAULT_COSTS.unary)?;
+        let op = *Self::un_ops_for(want).choose(&mut rand::rng()).unwrap();
+        let operand = match op {
+            UnOp::Neg => self.gen_expr(&Ty::Number)?,
+            UnOp::Not => self.gen_expr(&Ty::Any)?, // anything is truthy or falsy
+            // `#` takes a string or a table
+            UnOp::Len => match rand::random_range(1..=2) {
+                1 => self.gen_expr(&Ty::String)?,
+                _ => self.gen_expr(&Ty::Array(Box::from(Self::gen_element_ty())))?
+            }
+        };
         Ok(Expr::Unary {
-            op: Self::gen_un_op(),
-            operand: Box::from(self.gen_expr()?)
+            op,
+            operand: Box::from(operand)
         })
     }
 
-    fn gen_bin_op() -> BinOp {
-        match rand::random_range(0..=15) {
-            0 => BinOp::Add,
-            1 => BinOp::Sub,
-            2 => BinOp::Mul,
-            3 => BinOp::Div,
-            4 => BinOp::FloorDiv,
-            5 => BinOp::Mod,
-            6 => BinOp::Pow,
-            7 => BinOp::Concat,
-            8 => BinOp::Eq,
-            9 => BinOp::Ne,
-            10 => BinOp::Lt,
-            11 => BinOp::Le,
-            12 => BinOp::Gt,
-            13 => BinOp::Ge,
-            14 => BinOp::And,
-            15 => BinOp::Or,
-            _ => BinOp::Add
+    /// Arithmetic produces a number, `..` a string, comparisons a boolean.
+    /// `and` and `or` produce one of their operands, so they only fit where
+    /// any value is acceptable.
+    fn bin_ops_for(want: &Ty) -> Vec<BinOp> {
+        let arith = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::FloorDiv, BinOp::Mod, BinOp::Pow];
+        let compare = [BinOp::Eq, BinOp::Ne, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge];
+        match want {
+            Ty::Number => arith.to_vec(),
+            Ty::String => vec![BinOp::Concat],
+            Ty::Boolean => compare.to_vec(),
+            _ => {
+                let mut ops = arith.to_vec();
+                ops.extend(compare);
+                ops.extend([BinOp::Concat, BinOp::And, BinOp::Or]);
+                ops
+            }
         }
     }
 
-    fn gen_binary_expr(&mut self) -> Result<Expr, ()> {
+    fn gen_binary_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
         self.use_fuel(DEFAULT_COSTS.binary)?;
+        let op = *Self::bin_ops_for(want).choose(&mut rand::rng()).unwrap();
+        // both sides share a type: `<` on mixed operands is a runtime error and
+        // `==` on mixed operands is just always false
+        let operand_ty = match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+            | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => Ty::Number,
+            // `..` takes numbers too, and turns them into strings
+            BinOp::Concat | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                match rand::random_range(1..=2) {
+                    1 => Ty::Number,
+                    _ => Ty::String
+                }
+            },
+            BinOp::Eq | BinOp::Ne => Self::gen_ty(),
+            BinOp::And | BinOp::Or => Ty::Any
+        };
         Ok(Expr::Binary {
-            op: Self::gen_bin_op(),
-            left: Box::from(self.gen_expr()?),
-            right: Box::from(self.gen_expr()?)
+            op,
+            left: Box::from(self.gen_expr(&operand_ty)?),
+            right: Box::from(self.gen_expr(&operand_ty)?)
         })
     }
 
-    fn gen_paren_expr(&mut self) -> Result<Expr, ()> {
+    fn gen_paren_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
         self.use_fuel(DEFAULT_COSTS.paren)?;
-        Ok(Expr::Paren(Box::from(self.gen_expr()?)))
+        Ok(Expr::Paren(Box::from(self.gen_expr(want)?)))
     }
 
     fn gen_function_body(&mut self) -> Result<FunctionBody, ()> {
@@ -186,104 +273,144 @@ impl AstGenerator {
     }
 
     fn gen_function_expr(&mut self) -> Result<Expr, ()> {
+        // TODO: take a `want` and honour its FnSig. Nothing demands a function
+        // type yet, because a body cannot return to order until LastStmt is
+        // generated, so every function here is an unconstrained one.
         self.use_fuel(DEFAULT_COSTS.function_expr)?;
         Ok(Expr::Function(
             self.gen_function_body()?
         ))
     }
 
-    fn gen_table_field(&mut self) -> Result<TableField, ()> {
+    /// An `Array(t)` is array-shaped by definition, so it takes positional
+    /// fields of `t` and nothing else. A table nobody has a type for can have
+    /// any shape.
+    fn gen_table_field(&mut self, want: &Ty) -> Result<TableField, ()> {
+        if let Ty::Array(elem) = want {
+            self.use_fuel(DEFAULT_COSTS.table_field_positional)?;
+            return Ok(TableField::Positional(
+                self.gen_expr(elem)?
+            ));
+        }
         match rand::random_range(1..=3) {
             1 => {
                 self.use_fuel(DEFAULT_COSTS.table_field_positional)?;
                 Ok(TableField::Positional(
-                    self.gen_expr()?
+                    self.gen_expr(&Self::gen_ty())?
                 ))
             },
             2 => {
                 self.use_fuel(DEFAULT_COSTS.table_field_named)?;
                 Ok(TableField::Named {
                     name: self.ident_gen.gen_ident(),
-                    value: self.gen_expr()?,
+                    value: self.gen_expr(&Self::gen_ty())?,
                 })
             },
             _ => {
                 self.use_fuel(DEFAULT_COSTS.table_field_keyed)?;
                 Ok(TableField::Keyed {
-                    key: self.gen_expr()?,
-                    value: self.gen_expr()?,
+                    // a computed number key can come out NaN, which is a
+                    // runtime error, so keys are strings for now
+                    key: self.gen_expr(&Ty::String)?,
+                    value: self.gen_expr(&Self::gen_ty())?,
                 })
             }
         }
     }
 
-    fn gen_table_fields(&mut self) -> Result<Vec<TableField>, ()> {
+    fn gen_table_fields(&mut self, want: &Ty) -> Result<Vec<TableField>, ()> {
         let mut table_fields: Vec<TableField> = vec![];
         loop {
             if let 2 = rand::random_range(1..=2) {
                 break;
             }
             table_fields.push(
-                self.gen_table_field()?
+                self.gen_table_field(want)?
             )
         }
         Ok(table_fields)
     }
 
-    fn gen_table_expr(&mut self) -> Result<Expr, ()> {
+    fn gen_table_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
         self.use_fuel(DEFAULT_COSTS.table)?;
         Ok(Expr::Table(
-            self.gen_table_fields()?
+            self.gen_table_fields(want)?
         ))
     }
 
-    fn gen_ifelse_expr(&mut self) -> Result<Expr, ()> {
+    fn gen_ifelse_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
         self.use_fuel(DEFAULT_COSTS.if_else_expr)?;
         Ok(Expr::IfElse {
-            cond: Box::from(self.gen_expr()?),
-            then: Box::from(self.gen_expr()?),
-            else_: Box::from(self.gen_expr()?)
+            cond: Box::from(self.gen_expr(&Ty::Any)?), // any value is truthy or falsy
+            then: Box::from(self.gen_expr(want)?),
+            else_: Box::from(self.gen_expr(want)?)
         })
     }
 
-    fn gen_literal_expr(&mut self) -> Result<Expr, ()> {
+    fn gen_literal_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
         self.use_fuel(DEFAULT_COSTS.literal)?;
-        Ok(Expr::Literal(Self::gen_random_literal()))
+        Ok(Expr::Literal(Self::gen_random_literal(want)))
     }
 
-    fn gen_expr(&mut self) -> Result<Expr, ()> {
-        let chosen_expr = *self.get_avail().choose(&mut rand::rng()).unwrap();
+    
+
+    fn gen_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
+        // every form in here produces a `want`, so the type is decided before
+        // the expression is built and never has to be worked out afterwards
+        let chosen_expr = *self.get_avail(want).choose(&mut rand::rng()).unwrap();
         // no early returns between these, so the depth is restored even when out of fuel
         self.expr_depth += 1;
         let expr = match chosen_expr {
-            0 => self.gen_literal_expr(),
-            3 => self.gen_unary_expr(),
-            4 => self.gen_binary_expr(),
-            5 => self.gen_paren_expr(),
-            9 => self.gen_function_expr(),
-            10 => self.gen_table_expr(),
-            11 => self.gen_ifelse_expr(),
-            _ => { Ok(Expr::Literal(Literal::Nil)) }
+            ExprKind::Literal => self.gen_literal_expr(want),
+            ExprKind::Unary => self.gen_unary_expr(want),
+            ExprKind::Binary => self.gen_binary_expr(want),
+            ExprKind::Paren => self.gen_paren_expr(want),
+            ExprKind::Function => self.gen_function_expr(),
+            ExprKind::Table => self.gen_table_expr(want),
+            ExprKind::IfElse => self.gen_ifelse_expr(want)
         };
         self.expr_depth -= 1;
         expr
     }
 
     fn gen_local(&mut self) -> Result<Stmt, ()> {
-        let mut names: Vec<LocalName> = Vec::new();
+        // the type of each name is picked first, so the values can be generated
+        // to match and the annotations can be honest about them
+        let mut tys: Vec<Ty> = Vec::new();
         loop { // a local needs at least one name
             self.use_fuel(DEFAULT_COSTS.local)?;
-            names.push(self.gen_local_name(Self::gen_random_literal()));
+            tys.push(Self::gen_ty());
             if let 2 = rand::random_range(1..=2) {
                 break;
             }
         }
+        let name_count = tys.len();
         let mut values: Vec<Expr> = Vec::new();
+        let mut i = 0;
         loop {
-            if let 2 = rand::random_range(1..=2) {
-                break;
+            i += 1;
+            // 10% chance of fewer values
+            if !(i == 1) {
+                if let 1 = rand::random_range(1..=10) {
+                    break;
+                }
             }
-            values.push(self.gen_expr()?);
+            if i >= name_count {
+                // 20% chance of extra values
+                if let 1 = rand::random_range(1..=5) {}
+                else {
+                    break;
+                }
+            }
+            // a value past the last name is discarded, so its type is free
+            let want = tys.get(values.len()).cloned().unwrap_or(Ty::Any);
+            values.push(self.gen_expr(&want)?);
+        }
+        let mut names: Vec<LocalName> = Vec::new();
+        for (i, ty) in tys.iter().enumerate() {
+            // a name with no value of its own is nil
+            let honest = if i < values.len() { ty.clone() } else { Ty::Nil };
+            names.push(self.gen_local_name(&honest));
         }
         Ok(Stmt::Local {
             names,
