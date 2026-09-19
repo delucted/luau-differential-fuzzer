@@ -1,4 +1,7 @@
+use std::collections::HashSet;
 use crate::code_gen::ast::Ident;
+use rand;
+use rand::seq::{IndexedRandom};
 
 /// The static type the generator believes a variable holds. This is the
 /// generator's bookkeeping, not Luau's type system, and it may be wrong on
@@ -73,18 +76,108 @@ pub struct Frame {
     pub start: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Env {
     /// Every variable in scope, innermost last. Walk from the end and skip
     /// names already seen to get correct shadowing.
-    pub vars: Vec<Var>,
+    vars: Vec<Var>,
     /// Open scopes, outermost first. The chunk itself is the first frame
     /// and is a vararg `Function` frame.
-    pub frames: Vec<Frame>,
+    frames: Vec<Frame>,
     /// Assigned globals. Visible everywhere regardless of frames, and they
     /// compile to different bytecode than locals or upvalues.
-    pub globals: Vec<Var>,
-    /// Program-wide counter for fresh identifiers, so names are unique
-    /// without a lookup.
-    pub next_id: u32,
+    globals: Vec<Var>,
+
+    next_id: u32
+}
+
+impl Env {
+    pub fn new() -> Self {
+        Self {
+            vars: Vec::default(),
+            frames: vec![Frame { kind: FrameKind::Block, start: 0 }],
+            globals: Vec::default(),
+            next_id: 0
+        }
+    }
+    pub fn define_var(&mut self, name: &Ident, ty: Ty, kind: VarKind) {
+        self.vars.push(Var {
+            name: name.clone(),
+            ty,
+            kind,
+            frame: self.frames.len() - 1,
+            reassigned: false
+        });
+    }
+
+    pub fn define_global(&mut self, name: &Ident, ty: Ty) {
+        self.globals.push(Var {
+            name: name.clone(),
+            ty,
+            kind: VarKind::Local,
+            frame: self.frames.len() - 1,
+            reassigned: false
+        });
+    }
+
+    pub fn new_frame(&mut self, kind: FrameKind) {
+        self.frames.push(Frame {
+            kind, start: self.vars.len()
+        });
+    }
+
+    pub fn close_frame(&mut self) {
+        assert!(self.frames.len() > 1, "cannot close the chunk frame");
+        let start = self.frames.pop().unwrap().start;
+        self.vars.truncate(start);
+    }
+
+    fn fresh_name(&mut self, prefix: char) -> String {
+        self.next_id += 1;
+        format!("{}{}", prefix, self.next_id)
+    }
+
+    pub fn fresh_var_name(&mut self) -> String {
+        self.fresh_name('v')
+    }
+
+    pub fn fresh_global_name(&mut self) -> String {
+        self.fresh_name('G')
+    }
+
+    pub fn get_lvalue_of(&self, ty: &Ty) -> Option<&Var> {
+        let mut seen = HashSet::new();
+        self.vars
+            .iter()
+            .rev()
+            .filter(|v| seen.insert(&v.name))
+            .find(|v| v.ty == *ty)
+    }
+
+    fn visible(&self) -> Vec<&Var> {
+        let mut seen = HashSet::new();
+        self.vars
+            .iter()
+            .rev()
+            .chain(self.globals.iter())
+            .filter(|v| seen.insert(&v.name))
+            .collect()
+    }
+
+    pub fn has_var_matching(&self, test: impl Fn(&Ty) -> bool) -> bool {
+        self.visible().iter().any(|var| test(&var.ty))
+    }
+    
+    pub fn random_var_matching(&self, test: impl Fn(&Ty) -> bool) -> Option<&Var> {
+        self.visible()
+            .into_iter()
+            .filter(|var| test(&var.ty))
+            .collect::<Vec<&Var>>()
+            .choose(&mut rand::rng())
+            .copied()
+    }
+    
+    pub fn get_globals(&self) -> Vec<Var> {
+        self.globals.clone()
+    }
 }

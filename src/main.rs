@@ -7,7 +7,11 @@ mod reducer;
 
 use clap::Parser;
 use anyhow::Result;
+use crate::code_gen::ast::Printer;
 use crate::code_gen::ast_gen::AstGenerator;
+use crate::comparator::Comparator;
+use crate::report::Report;
+use crate::runner::run::Runner;
 
 /// A Luau Differential Fuzzer that emits potential bugs within the Luau compiler.
 #[derive(Parser, Debug)]
@@ -35,9 +39,24 @@ fn main() -> Result<()> {
     //     print!("{}", c as char)
     // }
 
+    let runner_o0 = Runner::for_release(&args.release)?.with_o0()?;
+    let runner_o2 = Runner::for_release(&args.release)?.with_o2()?;
     let mut ast_gen = AstGenerator::new(args.fuel);
 
-    println!("{:?}", ast_gen.gen_ast());
+    let mut checked = 0;
+    let mut discrepancies = 0;
+    loop {
+        print!("\x1B[2J\x1B[H");
+        println!("Luau Differential Fuzzer | {} checked | {} discrepancies", checked, discrepancies);
+        let sample = ast_gen.gen_ast().print();
+        let a = &runner_o0.run(&sample)?;
+        let b = &runner_o2.run(&sample)?;
+        if let Some(diffs) = Comparator::compare(a, b) {
+            discrepancies += 1;
+            Report::report(&sample, a, b, diffs)?;
+        }
+        checked += 1;
+    }
 
     Ok(())
 }

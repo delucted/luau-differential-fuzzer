@@ -10,7 +10,7 @@ pub struct Comparator {}
 
 impl Comparator {
     /// Returns a `Vec` of observed differences between oracles a and b.
-    fn compare(a: &RunOutput, b: &RunOutput) -> Option<Vec<DiffType>> {
+    pub(crate) fn compare(a: &RunOutput, b: &RunOutput) -> Option<Vec<DiffType>> {
         let mut diffs: Vec<DiffType> = Vec::new();
         let mut found = false;
         if a.stdout != b.stdout {

@@ -4,7 +4,6 @@
 use crate::code_gen::ast::*;
 use crate::code_gen::env::*;
 use crate::code_gen::costs::DEFAULT_COSTS;
-use crate::code_gen::ident_gen::IdentGen;
 use rand;
 use rand::seq::{IndexedRandom};
 
@@ -14,7 +13,6 @@ pub struct AstGenerator {
     fuel: i32,
     expr_depth: i32,
     function_depth: i32,
-    ident_gen: IdentGen,
     env: Env,
 }
 
@@ -24,8 +22,7 @@ impl AstGenerator {
             fuel: fuel as i32,
             expr_depth: 0,
             function_depth: 0,
-            ident_gen: IdentGen::new(),
-            env: Env::default()
+            env: Env::new()
         }
     }
 
@@ -88,8 +85,12 @@ impl AstGenerator {
 
     fn gen_local_name(&mut self, honest: &Ty) -> LocalName {
         LocalName {
-            name: self.ident_gen.gen_ident(),
-            annotation: Some(Self::gen_annotation(honest))
+            name: if self.function_depth == 0 {
+                self.env.fresh_global_name()
+            } else {
+                self.env.fresh_var_name()
+            },
+            annotation: None
         }
     }
 
@@ -122,7 +123,7 @@ impl AstGenerator {
         // TODO: Ty::Function, once a body can be generated to match a signature
     }
 
-    /// Element types stay scalar, so a type cannot nest without bound.
+    /// Element types stay scalar, so a type cannot just nest infinitely.
     fn gen_element_ty() -> Ty {
         match rand::random_range(1..=4) {
             1 => Ty::Number,
@@ -134,29 +135,43 @@ impl AstGenerator {
 
     /// Get the expression forms that can produce a `want` in the current state
     fn get_avail(&self, want: &Ty) -> Vec<ExprKind> {
-        // at the depth cap, only the form that needs nothing below it
+        // the leaf forms first. Neither has an expression under it, so both
+        // are still allowed once the depth cap is reached
+        let mut avail: Vec<ExprKind> = Vec::new();
+        if self.env.has_var_matching(|ty| Self::satisfies(ty, want)) {
+            avail.push(ExprKind::Var);
+        }
+        if !matches!(want, Ty::Array(_) | Ty::Function(_)) {
+            avail.push(ExprKind::Literal); // no literal writes a table or a function
+        }
+
         if self.expr_depth >= DEFAULT_COSTS.max_expr_depth {
-            return vec![Self::leaf_kind(want)];
+            if avail.is_empty() {
+                // a table or a function with no variable to read it from has to
+                // be built; its contents are a level deeper, so they are leaves
+                avail.push(Self::leaf_kind(want));
+            }
+            return avail;
         }
 
         // these two pass the demand straight through, so they fit any `want`
-        let mut avail: Vec<ExprKind> = vec![ExprKind::Paren, ExprKind::IfElse];
+        avail.extend([ExprKind::Paren, ExprKind::IfElse]);
         match want {
-            Ty::Number => avail.extend([ExprKind::Literal, ExprKind::Unary, ExprKind::Binary]),
-            Ty::String => avail.extend([ExprKind::Literal, ExprKind::Binary]),
-            Ty::Boolean => avail.extend([ExprKind::Literal, ExprKind::Unary, ExprKind::Binary]),
-            Ty::Nil => avail.push(ExprKind::Literal),
+            Ty::Number => avail.extend([ExprKind::Unary, ExprKind::Binary]),
+            Ty::String => avail.push(ExprKind::Binary),
+            Ty::Boolean => avail.extend([ExprKind::Unary, ExprKind::Binary]),
+            Ty::Nil => {},
             Ty::Array(_) => avail.push(ExprKind::Table),
             Ty::Function(_) => avail.push(ExprKind::Function),
             Ty::Any => {
-                avail.extend([ExprKind::Literal, ExprKind::Unary, ExprKind::Binary, ExprKind::Table]);
+                avail.extend([ExprKind::Unary, ExprKind::Binary, ExprKind::Table]);
                 if self.function_depth < DEFAULT_COSTS.max_function_depth {
                     avail.push(ExprKind::Function);
                 }
             }
         }
 
-        avail // TODO: Var, Call, Index and Field, once the env is filled in
+        avail // TODO: Call, Index and Field, once calls and reads are generated
     }
 
     /// The only form that can produce a `want` with no expression under it,
@@ -254,7 +269,7 @@ impl AstGenerator {
             self.use_fuel(DEFAULT_COSTS.param)?;
             params.push(
                 Param {
-                    name: self.ident_gen.gen_ident(),
+                    name: self.env.fresh_var_name(),
                     annotation: None
                 }
             )
@@ -265,7 +280,9 @@ impl AstGenerator {
             _ => false
         };
         self.function_depth += 1;
+        self.env.new_frame(FrameKind::Function { is_vararg, ret: vec![] });
         let body = self.gen_block();
+        self.env.close_frame();
         self.function_depth -= 1;
         Ok(FunctionBody {
             params, is_vararg, body: body?
@@ -302,7 +319,7 @@ impl AstGenerator {
             2 => {
                 self.use_fuel(DEFAULT_COSTS.table_field_named)?;
                 Ok(TableField::Named {
-                    name: self.ident_gen.gen_ident(),
+                    name: self.env.fresh_var_name(),
                     value: self.gen_expr(&Self::gen_ty())?,
                 })
             },
@@ -352,16 +369,30 @@ impl AstGenerator {
         Ok(Expr::Literal(Self::gen_random_literal(want)))
     }
 
-    
+    /// Whether a variable of type `ty` can be read where a `want` is demanded.
+    /// A demand for `Any` takes anything, but an `Any` variable satisfies
+    /// nothing else: once the generator has lost track of a value, it can only
+    /// go where any value is fine.
+    fn satisfies(ty: &Ty, want: &Ty) -> bool {
+        matches!(want, Ty::Any) || ty == want
+    }
+
+    fn gen_var_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
+        self.use_fuel(DEFAULT_COSTS.var)?;
+        Ok(Expr::Var(
+            self.env.random_var_matching(|ty| Self::satisfies(ty, want))
+                .ok_or(())?
+                .name
+                .clone()
+        ))
+    }
 
     fn gen_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
-        // every form in here produces a `want`, so the type is decided before
-        // the expression is built and never has to be worked out afterwards
         let chosen_expr = *self.get_avail(want).choose(&mut rand::rng()).unwrap();
-        // no early returns between these, so the depth is restored even when out of fuel
         self.expr_depth += 1;
         let expr = match chosen_expr {
             ExprKind::Literal => self.gen_literal_expr(want),
+            ExprKind::Var => self.gen_var_expr(want),
             ExprKind::Unary => self.gen_unary_expr(want),
             ExprKind::Binary => self.gen_binary_expr(want),
             ExprKind::Paren => self.gen_paren_expr(want),
@@ -410,7 +441,11 @@ impl AstGenerator {
         for (i, ty) in tys.iter().enumerate() {
             // a name with no value of its own is nil
             let honest = if i < values.len() { ty.clone() } else { Ty::Nil };
-            names.push(self.gen_local_name(&honest));
+            let name = self.gen_local_name(&honest);
+            if self.function_depth == 0 {
+                self.env.define_global(&name.name, honest);
+            }
+            names.push(name);
         }
         Ok(Stmt::Local {
             names,
@@ -418,12 +453,118 @@ impl AstGenerator {
         })
     }
 
+    fn get_lvalue(&mut self, test: fn(ty: &Ty) -> bool, allow_index: bool) -> Result<(LValue, Ty), ()> {
+        let indexable = |ty: &Ty| matches!(ty, Ty::Array(elem) if test(elem));
+
+        let mut kinds = vec![LValueKind::Var];
+        if allow_index && self.env.has_var_matching(indexable) {
+            kinds.push(LValueKind::Index);
+        }
+        // TODO: LValueKind::Field, once `Ty` can describe a table's named fields
+        match kinds.choose(&mut rand::rng()).unwrap() {
+            LValueKind::Index => {
+                self.use_fuel(DEFAULT_COSTS.index)?;
+                let var = self.env
+                    .random_var_matching(indexable)
+                    .ok_or(())?;
+                let elem = match &var.ty {
+                    Ty::Array(elem) => elem.as_ref().clone(),
+                    _ => Ty::Any
+                };
+                let object = Expr::Var(var.name.clone());
+
+                let key = match rand::random_range(1..=2) {
+                    1 => Expr::Literal(Literal::Number(1f64)),
+                    _ => Expr::Binary {
+                        op: BinOp::Add,
+                        left: Box::from(Expr::Unary {
+                            op: UnOp::Len,
+                            operand: Box::from(object.clone())
+                        }),
+                        right: Box::from(Expr::Literal(Literal::Number(1f64)))
+                    }
+                };
+                Ok((LValue::Index { object, key }, elem))
+            },
+            _ => {
+                let var = self.env
+                    .random_var_matching(|ty| !matches!(ty, Ty::Function(_)) && test(ty))
+                    .ok_or(())?;
+                Ok((LValue::Var(var.name.clone()), var.ty.clone()))
+            }
+        }
+    }
+
+    fn gen_assign(&mut self) -> Result<Stmt, ()> {
+        let mut targets: Vec<(LValue, Ty)> = vec![];
+        loop { // gen targets
+            self.use_fuel(DEFAULT_COSTS.assign)?;
+            let v = self.get_lvalue(|_| true, true)?;
+            targets.push(v);
+            if let 1 = rand::random_range(1..=2) {
+                break;
+            }
+        }
+        let mut values: Vec<Expr> = vec![];
+        let mut t: Vec<LValue> = vec![];
+        for (target, ty) in targets {
+            t.push(target);
+            values.push(self.gen_expr(&ty)?);
+        }
+        Ok(Stmt::Assign {
+            targets: t,
+            values
+        })
+    }
+
+    fn get_numeric_compound_op(&mut self) -> CompoundOp {
+        match rand::random_range(1..=7) {
+            1 => CompoundOp::Add,
+            2 => CompoundOp::Sub,
+            3 => CompoundOp::Mul,
+            4 => CompoundOp::Div,
+            5 => CompoundOp::FloorDiv,
+            6 => CompoundOp::Mod,
+            _ => CompoundOp::Pow
+        }
+    }
+
+    fn gen_compound_assign(&mut self) -> Result<Stmt, ()> {
+        self.use_fuel(DEFAULT_COSTS.compound_assign)?;
+        let v = self.get_lvalue(
+            |ty| matches!(ty, Ty::Number | Ty::String), false
+        )?;
+        Ok(Stmt::CompoundAssign {
+            target: v.0,
+            op: match v.1 {
+                Ty::String => CompoundOp::Concat,
+                _ => self.get_numeric_compound_op()
+            },
+            value: self.gen_expr(&v.1)?
+        })
+    }
+
+    fn avail_stmts(&mut self) -> Vec<StmtKind> {
+        let mut stmt_kinds = vec![StmtKind::Local];
+        if self.env.has_var_matching(|_| true) {  // has any lvalue
+            stmt_kinds.push(StmtKind::Assign);
+        }
+        if self.env.has_var_matching(|ty| matches!(ty, Ty::Number | Ty::String)) {
+            stmt_kinds.push(StmtKind::CompoundAssign);
+        }
+        stmt_kinds
+    }
+
     fn gen_stmt(&mut self) -> Result<Stmt, ()> {
-        let chosen_stmt: u8 = rand::random_range(1..=1);
+        let chosen_stmt = self.avail_stmts()
+            .choose(&mut rand::rng())
+            .unwrap()
+            .clone();
         match chosen_stmt {
-            1 => self.gen_local(),
-            _ => self.gen_local()
-            // 2 => self.gen_assign(),
+            StmtKind::Local => self.gen_local(),
+            StmtKind::Assign => self.gen_assign(),
+            _ => self.gen_compound_assign(),
+            // StmtKind::CompoundAssign
         }
     }
 
@@ -461,6 +602,12 @@ impl AstGenerator {
                 }
             }
         }
+
+        let mut globals: Vec<Ident> = vec![];
+        for global in self.env.get_globals() {
+            globals.push(global.name);
+        }
+        stmts.push(Stmt::PrintGlobals(globals));
         Program {
             body: Block {
                 stmts,
