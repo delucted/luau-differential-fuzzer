@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use crate::code_gen::ast::Ident;
 use rand;
-use rand::seq::{IndexedRandom};
 
 /// The static type the generator believes a variable holds. This is the
 /// generator's bookkeeping, not Luau's type system, and it may be wrong on
@@ -76,7 +75,7 @@ pub struct Frame {
     pub start: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Env {
     /// Every variable in scope, innermost last. Walk from the end and skip
     /// names already seen to get correct shadowing.
@@ -154,27 +153,31 @@ impl Env {
             .find(|v| v.ty == *ty)
     }
 
-    fn visible(&self) -> Vec<&Var> {
-        let mut seen = HashSet::new();
-        self.vars
-            .iter()
-            .rev()
-            .chain(self.globals.iter())
-            .filter(|v| seen.insert(&v.name))
-            .collect()
+    /// Every variable visible from here, innermost first.
+    ///
+    /// No shadowing check, and no allocation: `fresh_name` hands out a new name
+    /// every time, so two variables in scope can never share one. Reusing names
+    /// would mean walking back to the innermost of each, which is what the
+    /// `HashSet` in `get_lvalue_of` does.
+    fn visible(&self) -> impl Iterator<Item = &Var> {
+        self.vars.iter().rev().chain(self.globals.iter())
     }
 
     pub fn has_var_matching(&self, test: impl Fn(&Ty) -> bool) -> bool {
-        self.visible().iter().any(|var| test(&var.ty))
+        self.visible().any(|var| test(&var.ty))
     }
-    
+
+    /// Counts the candidates, then walks to the one it picked. Two passes and a
+    /// single random draw, against one allocation per call: this runs once per
+    /// expression node, so it is worth the second pass.
     pub fn random_var_matching(&self, test: impl Fn(&Ty) -> bool) -> Option<&Var> {
+        let matches = self.visible().filter(|var| test(&var.ty)).count();
+        if matches == 0 {
+            return None;
+        }
         self.visible()
-            .into_iter()
             .filter(|var| test(&var.ty))
-            .collect::<Vec<&Var>>()
-            .choose(&mut rand::rng())
-            .copied()
+            .nth(rand::random_range(0..matches))
     }
     
     pub fn get_globals(&self) -> Vec<Var> {

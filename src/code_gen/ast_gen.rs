@@ -9,6 +9,7 @@ use rand::seq::{IndexedRandom};
 
 const MAX_STMT_MISSES: u32 = 10;
 
+#[derive(Clone)]
 pub struct AstGenerator {
     fuel: i32,
     expr_depth: i32,
@@ -617,6 +618,10 @@ impl AstGenerator {
     }
 
     pub fn gen_ast(&mut self) -> Program {
-        self.gen_program()
+        let fuel = self.fuel;
+        self.env = Env::new();
+        let program = self.gen_program();
+        self.fuel = fuel;
+        program
     }
 }

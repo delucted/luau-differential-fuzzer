@@ -272,7 +272,7 @@ fn join_reader(
 /// Returns (status, timed_out). Kills the child if the deadline passes.
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(ExitStatus, bool)> {
     let deadline = Instant::now() + timeout;
-    let mut nap = Duration::from_millis(1);
+    let mut nap = Duration::from_micros(200);
 
     loop {
         match child.try_wait() {
@@ -295,6 +295,6 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(ExitStatus
 
         // Short naps first so fast scripts return quickly, backing off to 20ms.
         thread::sleep(nap.min(deadline - now));
-        nap = (nap * 2).min(Duration::from_millis(20));
+        nap = (nap * 2).min(Duration::from_millis(5));
     }
 }
