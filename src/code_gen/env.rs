@@ -144,6 +144,10 @@ impl Env {
         self.fresh_name('G')
     }
 
+    pub fn fresh_function_name(&mut self) -> String {
+        self.fresh_name('f')
+    }
+
     pub fn get_lvalue_of(&self, ty: &Ty) -> Option<&Var> {
         let mut seen = HashSet::new();
         self.vars

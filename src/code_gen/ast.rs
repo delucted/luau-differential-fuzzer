@@ -553,6 +553,7 @@ pub enum ExprKind {
     Unary,
     Binary,
     Paren,
+    Call,
     Function,
     Table,
     IfElse

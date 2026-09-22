@@ -6,8 +6,26 @@ use crate::code_gen::env::*;
 use crate::code_gen::costs::DEFAULT_COSTS;
 use rand;
 use rand::seq::{IndexedRandom};
+use crate::code_gen::ast::Call;
 
 const MAX_STMT_MISSES: u32 = 10;
+
+/// Arsenal of nastiness: numbers on some boundary (integer vs. fraction, the
+/// int32 range, the exact-integer range of a double, denormals), or ones a
+/// compiler is likely to special-case as a constant operand.
+const NASTY_NUMBERS: &[f64] = &[
+    0.0, -0.0, 1.0, -1.0, 0.1, 0.5, 1.5,
+    2.0, 3.0, 4.0, 5.0, 7.0, 8.0, 16.0, 31.0, 32.0, 255.0, 256.0,
+    ((1u64 << 31) - 1) as f64,
+    (1u64 << 31) as f64,
+    ((1u64 << 53) - 1) as f64,
+    (1u64 << 53) as f64,
+    ((1u64 << 53) + 2) as f64, // 2^53 + 1 is not a double; this is the next one up
+    1e-300,
+    f64::MIN_POSITIVE,
+    f64::from_bits(1), // smallest denormal
+    f64::MAX,
+];
 
 #[derive(Clone)]
 pub struct AstGenerator {
@@ -36,15 +54,15 @@ impl AstGenerator {
     }
 
     fn gen_number() -> Literal {
-        Literal::Number(match rand::random_range(1..=7) { // choose from arsenal of nastiness
-            1 => rand::random_range(0f64..=f64::MAX),
-            2 => 0f64,
-            3 => 1f64,
-            4 => -1f64,
-            5 => 2f64.powi(31),
-            6 => 2f64.powi(53),
-            7 => 0.1,
-            _ => 0f64
+        Literal::Number(match rand::random_range(0..10) {
+            0..=5 => *NASTY_NUMBERS.choose(&mut rand::rng()).unwrap(),
+            // log-uniform over the magnitudes real code tends to use
+            6..=7 => {
+                let n = 2f64.powf(rand::random_range(-64f64..64f64));
+                if rand::random_bool(0.5) { -n } else { n }
+            },
+            // anything at all, including NaNs, infinities and denormals
+            _ => f64::from_bits(rand::random()),
         })
     }
 
@@ -86,7 +104,9 @@ impl AstGenerator {
 
     fn gen_local_name(&mut self, honest: &Ty) -> LocalName {
         LocalName {
-            name: if self.function_depth == 0 {
+            name: if let Ty::Function(_) = honest {
+                self.env.fresh_function_name()
+            } else if self.function_depth == 0 {
                 self.env.fresh_global_name()
             } else {
                 self.env.fresh_var_name()
@@ -157,6 +177,9 @@ impl AstGenerator {
 
         // these two pass the demand straight through, so they fit any `want`
         avail.extend([ExprKind::Paren, ExprKind::IfElse]);
+        if self.env.has_var_matching(|ty| Self::returns(ty, want)) {
+            avail.push(ExprKind::Call);
+        }
         match want {
             Ty::Number => avail.extend([ExprKind::Unary, ExprKind::Binary]),
             Ty::String => avail.push(ExprKind::Binary),
@@ -172,7 +195,7 @@ impl AstGenerator {
             }
         }
 
-        avail // TODO: Call, Index and Field, once calls and reads are generated
+        avail // TODO: Index and Field
     }
 
     /// The only form that can produce a `want` with no expression under it,
@@ -261,48 +284,47 @@ impl AstGenerator {
         Ok(Expr::Paren(Box::from(self.gen_expr(want)?)))
     }
 
-    fn gen_function_body(&mut self) -> Result<FunctionBody, ()> {
-        let mut params: Vec<Param> = vec![];
-        loop {
-            if let 2 = rand::random_range(1..=2) {
-                break;
-            }
+    fn gen_function_body(&mut self, sig: &FnSig) -> Result<FunctionBody, ()> {
+        for _ in &sig.params {
             self.use_fuel(DEFAULT_COSTS.param)?;
-            params.push(
-                Param {
-                    name: self.env.fresh_var_name(),
-                    annotation: None
-                }
-            )
         }
-        let is_vararg = match rand::random_range(1..=2) {
-            1 => false,
-            2 => true,
-            _ => false
-        };
+
         self.function_depth += 1;
-        self.env.new_frame(FrameKind::Function { is_vararg, ret: vec![] });
+        self.env.new_frame(FrameKind::Function { is_vararg: sig.is_vararg, ret: sig.ret.clone() });
+        let mut params: Vec<Param> = Vec::new();
+        for ty in &sig.params {
+            let name = self.gen_local_name(ty).name;
+            self.env.define_var(&name, ty.clone(), VarKind::Param);
+            params.push(Param { name, annotation: None });
+        }
         let body = self.gen_block();
+
+        let mut rets: Vec<Expr> = Vec::new();
+        for to_ret in &sig.ret {
+            rets.push(self.gen_expr(to_ret)?);
+        }
+
         self.env.close_frame();
         self.function_depth -= 1;
+        
+        let mut body = body?.clone();
+        body.last = Some(LastStmt::Return(rets));
+
         Ok(FunctionBody {
-            params, is_vararg, body: body?
+            params, is_vararg: sig.is_vararg, body
         })
     }
 
-    fn gen_function_expr(&mut self) -> Result<Expr, ()> {
-        // TODO: take a `want` and honour its FnSig. Nothing demands a function
-        // type yet, because a body cannot return to order until LastStmt is
-        // generated, so every function here is an unconstrained one.
+    fn gen_function_expr(&mut self, want: &FnSig) -> Result<Expr, ()> {
+        // TODO: return values. The parameters follow `want`, but nothing makes
+        // a body end in a `return` of `want.ret` until LastStmt is generated,
+        // so every function still returns nothing whatever its signature says
         self.use_fuel(DEFAULT_COSTS.function_expr)?;
         Ok(Expr::Function(
-            self.gen_function_body()?
+            self.gen_function_body(want)?
         ))
     }
 
-    /// An `Array(t)` is array-shaped by definition, so it takes positional
-    /// fields of `t` and nothing else. A table nobody has a type for can have
-    /// any shape.
     fn gen_table_field(&mut self, want: &Ty) -> Result<TableField, ()> {
         if let Ty::Array(elem) = want {
             self.use_fuel(DEFAULT_COSTS.table_field_positional)?;
@@ -370,10 +392,6 @@ impl AstGenerator {
         Ok(Expr::Literal(Self::gen_random_literal(want)))
     }
 
-    /// Whether a variable of type `ty` can be read where a `want` is demanded.
-    /// A demand for `Any` takes anything, but an `Any` variable satisfies
-    /// nothing else: once the generator has lost track of a value, it can only
-    /// go where any value is fine.
     fn satisfies(ty: &Ty, want: &Ty) -> bool {
         matches!(want, Ty::Any) || ty == want
     }
@@ -388,6 +406,43 @@ impl AstGenerator {
         ))
     }
 
+    fn returns(ty: &Ty, want: &Ty) -> bool {
+        match ty {
+            Ty::Function(sig) => match sig.ret.first() {
+                Some(first) => Self::satisfies(first, want),
+                None => matches!(want, Ty::Nil | Ty::Any)
+            },
+            _ => false
+        }
+    }
+
+    fn gen_call_args(&mut self, sig: &FnSig) -> Result<Vec<Expr>, ()> {
+        let mut args: Vec<Expr> = Vec::new();
+        for ty in &sig.params {
+            args.push(self.gen_expr(ty)?);
+        }
+        if sig.is_vararg {
+            while rand::random_range(1..=2) == 1 {
+                args.push(self.gen_expr(&Ty::Any)?);
+            }
+        }
+        Ok(args)
+    }
+
+    fn gen_call_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
+        self.use_fuel(DEFAULT_COSTS.call)?;
+        let (name, sig) = match self.env.random_var_matching(|ty| Self::returns(ty, want)) {
+            Some(Var { name, ty: Ty::Function(sig), .. }) => (name.clone(), sig.clone()),
+            _ => return Err(())
+        };
+        let call = Expr::Call(Call {
+            callee: Box::from(Expr::Var(name)),
+            method: None,
+            args: self.gen_call_args(&sig)?
+        });
+        Ok(if sig.ret.len() > 1 { Expr::Paren(Box::from(call)) } else { call })
+    }
+
     fn gen_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
         let chosen_expr = *self.get_avail(want).choose(&mut rand::rng()).unwrap();
         self.expr_depth += 1;
@@ -397,7 +452,14 @@ impl AstGenerator {
             ExprKind::Unary => self.gen_unary_expr(want),
             ExprKind::Binary => self.gen_binary_expr(want),
             ExprKind::Paren => self.gen_paren_expr(want),
-            ExprKind::Function => self.gen_function_expr(),
+            ExprKind::Call => self.gen_call_expr(want),
+            ExprKind::Function => {
+                let sig = match want {
+                    Ty::Function(sig) => sig.clone(),
+                    _ => self.gen_random_fn_sig()
+                };
+                self.gen_function_expr(&sig)
+            },
             ExprKind::Table => self.gen_table_expr(want),
             ExprKind::IfElse => self.gen_ifelse_expr(want)
         };
@@ -553,7 +615,82 @@ impl AstGenerator {
         if self.env.has_var_matching(|ty| matches!(ty, Ty::Number | Ty::String)) {
             stmt_kinds.push(StmtKind::CompoundAssign);
         }
+        if self.function_depth < DEFAULT_COSTS.max_function_depth {
+            stmt_kinds.push(StmtKind::LocalFunction);
+            if self.function_depth == 0 {
+                stmt_kinds.push(StmtKind::Function);
+            }
+        }
+        if self.env.has_var_matching(|ty| matches!(ty, Ty::Function(_))) {
+            stmt_kinds.push(StmtKind::Call);
+        }
         stmt_kinds
+    }
+
+    fn gen_random_fn_sig(&mut self) -> FnSig {
+        let mut params: Vec<Ty> = Vec::new();
+        loop {
+            if rand::random_range(1..=3) == 3 {
+                break;
+            }
+            params.push(Self::gen_ty());
+        }
+        let is_vararg = if rand::random_range(1..= 3) == 3 { true } else { false };
+        let mut ret: Vec<Ty> = Vec::new();
+        loop {
+            if rand::random_range(1..=2) == 2 {
+                break;
+            }
+            ret.push(Self::gen_ty());
+        }
+        FnSig {
+            params, is_vararg, ret
+        }
+    }
+
+    fn gen_local_function(&mut self) -> Result<Stmt, ()> {
+        self.use_fuel(DEFAULT_COSTS.function_decl)?;
+        let sig = self.gen_random_fn_sig();
+        let ty = Ty::Function(sig.clone());
+        let name = self.gen_local_name(&ty).name;
+        let body = self.gen_function_body(&sig)?;
+        self.env.define_var(&name, ty, VarKind::LocalFunction);
+        Ok(Stmt::LocalFunction {
+            name, body
+        })
+    }
+
+    fn gen_global_function(&mut self) -> Result<Stmt, ()> {
+        self.use_fuel(DEFAULT_COSTS.function_decl)?;
+        let sig = self.gen_random_fn_sig();
+        let ty = Ty::Function(sig.clone());
+        let name = self.gen_local_name(&ty).name;
+        let body = self.gen_function_body(&sig)?;
+        self.env.define_global(&name, ty); // after the body, as above
+        Ok(Stmt::Function {
+            name, body
+        })
+    }
+
+    fn gen_call(&mut self) -> Result<Stmt, ()> {
+        self.use_fuel(DEFAULT_COSTS.call_stmt)?;
+        let (name, sig) = {
+            let var = self.env
+                .random_var_matching(|ty| matches!(ty, Ty::Function(_)))
+                .ok_or(())?;
+            match &var.ty {
+                Ty::Function(sig) => (var.name.clone(), sig.clone()),
+                _ => return Err(()) // unreachable: the pick is function-only
+            }
+        };
+
+        let args = self.gen_call_args(&sig)?;
+
+        Ok(Stmt::Call(Call {
+            callee: Box::from(Expr::Var(name)),
+            method: None,
+            args
+        }))
     }
 
     fn gen_stmt(&mut self) -> Result<Stmt, ()> {
@@ -564,18 +701,21 @@ impl AstGenerator {
         match chosen_stmt {
             StmtKind::Local => self.gen_local(),
             StmtKind::Assign => self.gen_assign(),
-            _ => self.gen_compound_assign(),
-            // StmtKind::CompoundAssign
+            StmtKind::CompoundAssign => self.gen_compound_assign(),
+            StmtKind::LocalFunction => self.gen_local_function(),
+            StmtKind::Function => self.gen_global_function(),
+            StmtKind::Call => self.gen_call(),
+            _ => self.gen_local() // kinds avail_stmts never offers yet
         }
     }
 
     fn gen_block(&mut self) -> Result<Block, ()> {
         let mut stmts: Vec<Stmt> = Vec::new();
         loop {
-            if let 2 = rand::random_range(1..=2) {
+            stmts.push(self.gen_stmt()?);
+            if let 2 = rand::random_range(1..=3) {
                 break;
             }
-            stmts.push(self.gen_stmt()?);
         }
 
         Ok(Block {
