@@ -157,12 +157,6 @@ impl Env {
             .find(|v| v.ty == *ty)
     }
 
-    /// Every variable visible from here, innermost first.
-    ///
-    /// No shadowing check, and no allocation: `fresh_name` hands out a new name
-    /// every time, so two variables in scope can never share one. Reusing names
-    /// would mean walking back to the innermost of each, which is what the
-    /// `HashSet` in `get_lvalue_of` does.
     fn visible(&self) -> impl Iterator<Item = &Var> {
         self.vars.iter().rev().chain(self.globals.iter())
     }
@@ -171,9 +165,6 @@ impl Env {
         self.visible().any(|var| test(&var.ty))
     }
 
-    /// Counts the candidates, then walks to the one it picked. Two passes and a
-    /// single random draw, against one allocation per call: this runs once per
-    /// expression node, so it is worth the second pass.
     pub fn random_var_matching(&self, test: impl Fn(&Ty) -> bool) -> Option<&Var> {
         let matches = self.visible().filter(|var| test(&var.ty)).count();
         if matches == 0 {

@@ -56,12 +56,10 @@ impl AstGenerator {
     fn gen_number() -> Literal {
         Literal::Number(match rand::random_range(0..10) {
             0..=5 => *NASTY_NUMBERS.choose(&mut rand::rng()).unwrap(),
-            // log-uniform over the magnitudes real code tends to use
             6..=7 => {
                 let n = 2f64.powf(rand::random_range(-64f64..64f64));
                 if rand::random_bool(0.5) { -n } else { n }
             },
-            // anything at all, including NaNs, infinities and denormals
             _ => f64::from_bits(rand::random()),
         })
     }
@@ -131,7 +129,6 @@ impl AstGenerator {
         }
     }
 
-    /// A type for a position that does not care which one it gets.
     fn gen_ty() -> Ty {
         match rand::random_range(1..=6) {
             1 => Ty::Number,
@@ -144,7 +141,6 @@ impl AstGenerator {
         // TODO: Ty::Function, once a body can be generated to match a signature
     }
 
-    /// Element types stay scalar, so a type cannot just nest infinitely.
     fn gen_element_ty() -> Ty {
         match rand::random_range(1..=4) {
             1 => Ty::Number,
@@ -154,28 +150,22 @@ impl AstGenerator {
         }
     }
 
-    /// Get the expression forms that can produce a `want` in the current state
     fn get_avail(&self, want: &Ty) -> Vec<ExprKind> {
-        // the leaf forms first. Neither has an expression under it, so both
-        // are still allowed once the depth cap is reached
         let mut avail: Vec<ExprKind> = Vec::new();
         if self.env.has_var_matching(|ty| Self::satisfies(ty, want)) {
             avail.push(ExprKind::Var);
         }
         if !matches!(want, Ty::Array(_) | Ty::Function(_)) {
-            avail.push(ExprKind::Literal); // no literal writes a table or a function
+            avail.push(ExprKind::Literal);
         }
 
         if self.expr_depth >= DEFAULT_COSTS.max_expr_depth {
             if avail.is_empty() {
-                // a table or a function with no variable to read it from has to
-                // be built; its contents are a level deeper, so they are leaves
                 avail.push(Self::leaf_kind(want));
             }
             return avail;
         }
 
-        // these two pass the demand straight through, so they fit any `want`
         avail.extend([ExprKind::Paren, ExprKind::IfElse]);
         if self.env.has_var_matching(|ty| Self::returns(ty, want)) {
             avail.push(ExprKind::Call);
@@ -198,8 +188,6 @@ impl AstGenerator {
         avail // TODO: Index and Field
     }
 
-    /// The only form that can produce a `want` with no expression under it,
-    /// for when the depth cap is reached.
     fn leaf_kind(want: &Ty) -> ExprKind {
         match want {
             Ty::Array(_) => ExprKind::Table,
@@ -208,7 +196,6 @@ impl AstGenerator {
         }
     }
 
-    /// `-` and `#` produce a number, `not` produces a boolean.
     fn un_ops_for(want: &Ty) -> Vec<UnOp> {
         match want {
             Ty::Number => vec![UnOp::Neg, UnOp::Len],
@@ -235,9 +222,6 @@ impl AstGenerator {
         })
     }
 
-    /// Arithmetic produces a number, `..` a string, comparisons a boolean.
-    /// `and` and `or` produce one of their operands, so they only fit where
-    /// any value is acceptable.
     fn bin_ops_for(want: &Ty) -> Vec<BinOp> {
         let arith = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::FloorDiv, BinOp::Mod, BinOp::Pow];
         let compare = [BinOp::Eq, BinOp::Ne, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge];
@@ -257,12 +241,9 @@ impl AstGenerator {
     fn gen_binary_expr(&mut self, want: &Ty) -> Result<Expr, ()> {
         self.use_fuel(DEFAULT_COSTS.binary)?;
         let op = *Self::bin_ops_for(want).choose(&mut rand::rng()).unwrap();
-        // both sides share a type: `<` on mixed operands is a runtime error and
-        // `==` on mixed operands is just always false
         let operand_ty = match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
             | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => Ty::Number,
-            // `..` takes numbers too, and turns them into strings
             BinOp::Concat | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 match rand::random_range(1..=2) {
                     1 => Ty::Number,
@@ -727,8 +708,6 @@ impl AstGenerator {
     fn gen_program(&mut self) -> Program {
         let mut stmts: Vec<Stmt> = Vec::new();
 
-        // a statement that runs out of fuel is dropped and refunded, then we try a (hopefully smaller) one.
-        // once enough attempts in a row fail, we're out of fuel for good
         let mut misses = 0;
         while misses < MAX_STMT_MISSES {
             let fuel = self.fuel;
