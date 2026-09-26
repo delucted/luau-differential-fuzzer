@@ -674,6 +674,10 @@ impl AstGenerator {
         }))
     }
 
+    fn gen_do(&mut self) -> Result<Stmt, ()> {
+        Ok(Stmt::Do(self.gen_block()?))
+    }
+
     fn gen_stmt(&mut self) -> Result<Stmt, ()> {
         let chosen_stmt = self.avail_stmts()
             .choose(&mut rand::rng())
@@ -686,6 +690,7 @@ impl AstGenerator {
             StmtKind::LocalFunction => self.gen_local_function(),
             StmtKind::Function => self.gen_global_function(),
             StmtKind::Call => self.gen_call(),
+            StmtKind::Do => self.gen_do(),
             _ => self.gen_local() // kinds avail_stmts never offers yet
         }
     }
